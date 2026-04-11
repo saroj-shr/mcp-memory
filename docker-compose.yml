@@ -29,10 +29,13 @@ services:
       - MCP_API_KEY=${MCP_API_KEY}
       - REST_API_KEY=${REST_API_KEY}
       - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - HF_TOKEN=${HF_TOKEN:-}
     depends_on:
       - qdrant
     networks:
       - kb-internal
+    volumes:
+      - model_cache:/app/models
 
 networks:
   kb-internal:
@@ -41,3 +44,4 @@ networks:
 
 volumes:
   qdrant_data:
+  model_cache:

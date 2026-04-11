@@ -50,6 +50,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 MCP_API_KEY = os.getenv("MCP_API_KEY", "")
 REST_API_KEY = os.getenv("REST_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+SENTENCE_TRANSFORMERS_HOME = "/app/models"
 COLLECTION_NAME = "knowledge_base"
 VECTOR_DIM = 384  # all-MiniLM-L6-v2 dimension
 
@@ -91,13 +92,14 @@ def init_services():
     global embedder, qdrant
 
     logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-    embedder = SentenceTransformer(EMBEDDING_MODEL)
+    embedder = SentenceTransformer(EMBEDDING_MODEL, cache_folder=SENTENCE_TRANSFORMERS_HOME)
 
     logger.info(f"Connecting to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
     qdrant = QdrantClient(
         host=QDRANT_HOST,
         port=QDRANT_PORT,
         api_key=QDRANT_API_KEY or None,
+        https=False,
     )
 
     # Create collection if it doesn't exist
@@ -262,7 +264,7 @@ def delete_entry(entry_id: str) -> bool:
 # ──────────────────────────────────────────────
 # MCP Server (port 3000)
 # ──────────────────────────────────────────────
-mcp = FastMCP("knowledge-base", port=3000)
+mcp = FastMCP("knowledge-base", port=3000, host="0.0.0.0")
 
 
 @mcp.tool()
