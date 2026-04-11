@@ -1,0 +1,43 @@
+services:
+  # ── Vector Database ──
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: kb-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
+    networks:
+      - kb-internal
+    # No ports exposed to host — only reachable by mcp-server on internal network
+
+  # ── MCP + REST Server ──
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kb-mcp-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # MCP SSE endpoint
+      - "3001:3001"   # REST API + Dashboard
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - MCP_API_KEY=${MCP_API_KEY}
+      - REST_API_KEY=${REST_API_KEY}
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+    depends_on:
+      - qdrant
+    networks:
+      - kb-internal
+
+networks:
+  kb-internal:
+    driver: bridge
+    internal: false  # set to true if you don't need external access to mcp-server
+
+volumes:
+  qdrant_data:
