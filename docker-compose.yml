@@ -14,7 +14,7 @@ services:
   # ── MCP + REST Server ──
   mcp-server:
     build:
-      context: .
+      context: ./server
       dockerfile: Dockerfile
     container_name: kb-mcp-server
     restart: unless-stopped

@@ -12,6 +12,7 @@ import {
   Settings,
   LogOut,
   Brain,
+  LayoutTemplate,
 } from "lucide-react";
 
 const navItems = [
@@ -19,6 +20,7 @@ const navItems = [
   { href: "/search", label: "Search", icon: Search },
   { href: "/projects", label: "Projects", icon: FolderKanban },
   { href: "/entries", label: "Entries", icon: FileText },
+  { href: "/templates", label: "Templates", icon: LayoutTemplate },
   { href: "/keys", label: "API Keys", icon: Key },
   { href: "/settings", label: "Settings", icon: Settings },
 ];

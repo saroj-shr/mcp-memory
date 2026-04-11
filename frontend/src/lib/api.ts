@@ -161,4 +161,36 @@ export const statsApi = {
   health: () => api.get("/health"),
 };
 
+// ── Templates ──
+export interface Template {
+  id: number;
+  name: string;
+  category: string;
+  description: string;
+  content: string;
+  variables: string[];
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TemplateCreateParams {
+  name: string;
+  category: string;
+  content: string;
+  description?: string;
+  variables?: string[];
+  tags?: string[];
+}
+
+export const templatesApi = {
+  list: (category?: string, search?: string) =>
+    api.get("/api/templates", { params: { category, search } }),
+  create: (params: TemplateCreateParams) => api.post("/api/templates", params),
+  get: (id: number) => api.get(`/api/templates/${id}`),
+  update: (id: number, params: Partial<TemplateCreateParams>) =>
+    api.put(`/api/templates/${id}`, params),
+  delete: (id: number) => api.delete(`/api/templates/${id}`),
+};
+
 export default api;
