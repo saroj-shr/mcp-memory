@@ -1,10 +1,10 @@
 """
 MCP Knowledge Base Server
 - MCP SSE endpoint on port 3000 (for Claude Code)
-- REST API + Dashboard on port 3001 (for Copilot / browser)
+- REST API on port 3001 (for frontend / programmatic access)
 - Local embeddings via sentence-transformers
 - Qdrant vector storage
-- API key auth on all endpoints
+- JWT + API key dual auth
 - Secret scrubbing before storage
 """
 
@@ -19,7 +19,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -32,11 +32,17 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
+    Range,
 )
 from sentence_transformers import SentenceTransformer
 
 # ── MCP imports ──
 from mcp.server.fastmcp import FastMCP
+
+# ── Local modules ──
+from db import init_db, create_project, list_projects_meta, get_project_meta, get_project_by_name, update_project, delete_project
+from auth import router as auth_router, keys_router, get_current_user, require_scope, require_admin
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("kb-server")
@@ -48,7 +54,6 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 MCP_API_KEY = os.getenv("MCP_API_KEY", "")
-REST_API_KEY = os.getenv("REST_API_KEY", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 SENTENCE_TRANSFORMERS_HOME = "/app/models"
 COLLECTION_NAME = "knowledge_base"
@@ -158,16 +163,29 @@ def store_entry(
 def search_entries(
     query: str,
     project: str | None = None,
+    entry_type: str | None = None,
+    tags: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_score: float = 0.0,
     limit: int = 5,
 ) -> list[dict]:
-    """Search knowledge base by semantic similarity."""
+    """Search knowledge base by semantic similarity with advanced filters."""
     vector = embed_text(query)
 
-    search_filter = None
+    must_conditions = []
     if project:
-        search_filter = Filter(
-            must=[FieldCondition(key="project", match=MatchValue(value=project))]
-        )
+        must_conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
+    if entry_type:
+        must_conditions.append(FieldCondition(key="type", match=MatchValue(value=entry_type)))
+    if tags:
+        must_conditions.append(FieldCondition(key="tags", match=MatchAny(any=tags)))
+    if date_from:
+        must_conditions.append(FieldCondition(key="created_at", range=Range(gte=date_from)))
+    if date_to:
+        must_conditions.append(FieldCondition(key="created_at", range=Range(lte=date_to)))
+
+    search_filter = Filter(must=must_conditions) if must_conditions else None
 
     results = qdrant.search(
         collection_name=COLLECTION_NAME,
@@ -188,6 +206,7 @@ def search_entries(
             "created_at": r.payload.get("created_at", ""),
         }
         for r in results
+        if r.score >= min_score
     ]
 
 
@@ -259,6 +278,136 @@ def delete_entry(entry_id: str) -> bool:
         points_selector=[entry_id],
     )
     return True
+
+
+def get_entry_by_id(entry_id: str) -> dict | None:
+    """Get a single entry by ID."""
+    results = qdrant.retrieve(
+        collection_name=COLLECTION_NAME,
+        ids=[entry_id],
+        with_payload=True,
+    )
+    if not results:
+        return None
+    r = results[0]
+    return {
+        "id": str(r.id),
+        "content": r.payload.get("content", ""),
+        "project": r.payload.get("project", ""),
+        "tags": r.payload.get("tags", []),
+        "type": r.payload.get("type", ""),
+        "source": r.payload.get("source", ""),
+        "created_at": r.payload.get("created_at", ""),
+    }
+
+
+def update_entry(entry_id: str, content: str | None = None, project: str | None = None,
+                  tags: list[str] | None = None, entry_type: str | None = None) -> dict | None:
+    """Update an existing entry. Re-embeds if content changes."""
+    existing = get_entry_by_id(entry_id)
+    if not existing:
+        return None
+
+    new_content = content if content is not None else existing["content"]
+    new_project = project if project is not None else existing["project"]
+    new_tags = tags if tags is not None else existing["tags"]
+    new_type = entry_type if entry_type is not None else existing["type"]
+
+    # Re-embed if content changed
+    if content is not None:
+        new_content = scrub_secrets(new_content)
+        vector = embed_text(new_content)
+    else:
+        # Keep existing vector — retrieve it
+        points = qdrant.retrieve(collection_name=COLLECTION_NAME, ids=[entry_id], with_vectors=True)
+        vector = points[0].vector if points else embed_text(new_content)
+
+    qdrant.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[
+            PointStruct(
+                id=entry_id,
+                vector=vector,
+                payload={
+                    "content": new_content,
+                    "project": new_project,
+                    "tags": new_tags,
+                    "type": new_type,
+                    "source": existing["source"],
+                    "created_at": existing["created_at"],
+                },
+            )
+        ],
+    )
+    return get_entry_by_id(entry_id)
+
+
+def bulk_delete_entries(entry_ids: list[str]) -> int:
+    """Delete multiple entries. Returns count deleted."""
+    qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=entry_ids,
+    )
+    return len(entry_ids)
+
+
+def export_entries(project: str | None = None, entry_type: str | None = None) -> list[dict]:
+    """Export all entries, optionally filtered."""
+    must_conditions = []
+    if project:
+        must_conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
+    if entry_type:
+        must_conditions.append(FieldCondition(key="type", match=MatchValue(value=entry_type)))
+
+    scroll_filter = Filter(must=must_conditions) if must_conditions else None
+
+    all_entries = []
+    offset = None
+    while True:
+        results, offset = qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100,
+            offset=offset,
+            scroll_filter=scroll_filter,
+            with_payload=True,
+        )
+        if not results:
+            break
+        for r in results:
+            all_entries.append({
+                "id": str(r.id),
+                "content": r.payload.get("content", ""),
+                "project": r.payload.get("project", ""),
+                "tags": r.payload.get("tags", []),
+                "type": r.payload.get("type", ""),
+                "source": r.payload.get("source", ""),
+                "created_at": r.payload.get("created_at", ""),
+            })
+        if offset is None:
+            break
+
+    return all_entries
+
+
+def get_all_tags() -> list[str]:
+    """Get all unique tags from entries."""
+    tags_set = set()
+    offset = None
+    while True:
+        results, offset = qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=100,
+            offset=offset,
+            with_payload=["tags"],
+        )
+        if not results:
+            break
+        for r in results:
+            for tag in r.payload.get("tags", []):
+                tags_set.add(tag)
+        if offset is None:
+            break
+    return sorted(tags_set)
 
 
 # ──────────────────────────────────────────────
@@ -350,6 +499,7 @@ def forget(entry_id: str) -> str:
 # ──────────────────────────────────────────────
 @asynccontextmanager
 async def rest_lifespan(app: FastAPI):
+    await init_db()
     yield
 
 rest_app = FastAPI(title="Knowledge Base REST API", lifespan=rest_lifespan)
@@ -360,13 +510,9 @@ rest_app.add_middleware(
     allow_headers=["*"],
 )
 
-security = HTTPBearer()
-
-
-def verify_rest_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != REST_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials
+# Include auth and keys routers
+rest_app.include_router(auth_router)
+rest_app.include_router(keys_router)
 
 
 # ── REST Models ──
@@ -380,13 +526,48 @@ class StoreRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    project: str | None = None
-    limit: int = 5
+    project: Optional[str] = None
+    entry_type: Optional[str] = None
+    tags: Optional[list[str]] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    min_score: float = 0.0
+    limit: int = 10
 
 
-# ── REST Endpoints ──
-@rest_app.post("/api/store", dependencies=[Depends(verify_rest_key)])
-def api_store(req: StoreRequest):
+class UpdateEntryRequest(BaseModel):
+    content: Optional[str] = None
+    project: Optional[str] = None
+    tags: Optional[list[str]] = None
+    entry_type: Optional[str] = None
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[str]
+
+
+class ImportRequest(BaseModel):
+    entries: list[StoreRequest]
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    color: str = "#7c6ff7"
+    icon: str = "folder"
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
+
+
+# ── REST Endpoints (all protected by dual auth) ──
+
+@rest_app.post("/api/store")
+async def api_store(req: StoreRequest, user: dict = Depends(require_scope("write"))):
     entry_id = store_entry(
         content=req.content,
         project=req.project,
@@ -397,24 +578,289 @@ def api_store(req: StoreRequest):
     return {"id": entry_id, "status": "stored"}
 
 
-@rest_app.post("/api/search", dependencies=[Depends(verify_rest_key)])
-def api_search(req: SearchRequest):
-    results = search_entries(query=req.query, project=req.project, limit=req.limit)
-    return {"results": results}
+@rest_app.post("/api/search")
+async def api_search(req: SearchRequest, user: dict = Depends(require_scope("read"))):
+    results = search_entries(
+        query=req.query,
+        project=req.project,
+        entry_type=req.entry_type,
+        tags=req.tags,
+        date_from=req.date_from,
+        date_to=req.date_to,
+        min_score=req.min_score,
+        limit=req.limit,
+    )
+    return {
+        "results": results,
+        "query": req.query,
+        "filters": {
+            "project": req.project,
+            "entry_type": req.entry_type,
+            "tags": req.tags,
+            "date_from": req.date_from,
+            "date_to": req.date_to,
+            "min_score": req.min_score,
+        },
+        "total_found": len(results),
+    }
 
 
-@rest_app.get("/api/projects", dependencies=[Depends(verify_rest_key)])
-def api_projects():
-    return {"projects": list_projects()}
+@rest_app.get("/api/entries/{entry_id}")
+async def api_get_entry(entry_id: str, user: dict = Depends(require_scope("read"))):
+    entry = get_entry_by_id(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return entry
 
 
-@rest_app.get("/api/recent", dependencies=[Depends(verify_rest_key)])
-def api_recent(project: str | None = None, limit: int = 10):
+@rest_app.put("/api/entries/{entry_id}")
+async def api_update_entry(entry_id: str, req: UpdateEntryRequest, user: dict = Depends(require_scope("write"))):
+    updated = update_entry(
+        entry_id=entry_id,
+        content=req.content,
+        project=req.project,
+        tags=req.tags,
+        entry_type=req.entry_type,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return updated
+
+
+@rest_app.delete("/api/entries/{entry_id}")
+async def api_delete_entry(entry_id: str, user: dict = Depends(require_scope("write"))):
+    delete_entry(entry_id)
+    return {"status": "deleted", "id": entry_id}
+
+
+@rest_app.post("/api/entries/bulk-delete")
+async def api_bulk_delete(req: BulkDeleteRequest, user: dict = Depends(require_scope("write"))):
+    count = bulk_delete_entries(req.ids)
+    return {"status": "deleted", "count": count}
+
+
+@rest_app.post("/api/entries/export")
+async def api_export(
+    project: Optional[str] = Query(None),
+    entry_type: Optional[str] = Query(None),
+    user: dict = Depends(require_scope("read")),
+):
+    entries = export_entries(project=project, entry_type=entry_type)
+    return {"entries": entries, "count": len(entries)}
+
+
+@rest_app.post("/api/entries/import")
+async def api_import(req: ImportRequest, user: dict = Depends(require_scope("write"))):
+    imported_ids = []
+    for entry in req.entries:
+        entry_id = store_entry(
+            content=entry.content,
+            project=entry.project,
+            tags=entry.tags,
+            entry_type=entry.entry_type,
+            source=entry.source or "import",
+        )
+        imported_ids.append(entry_id)
+    return {"status": "imported", "count": len(imported_ids), "ids": imported_ids}
+
+
+@rest_app.get("/api/tags")
+async def api_tags(user: dict = Depends(require_scope("read"))):
+    return {"tags": get_all_tags()}
+
+
+# ── Project CRUD (metadata in SQLite, entries in Qdrant) ──
+
+@rest_app.get("/api/projects")
+async def api_projects(user: dict = Depends(require_scope("read"))):
+    # Merge SQLite metadata with Qdrant entry counts
+    meta_projects = await list_projects_meta()
+    qdrant_projects = list_projects()  # from Qdrant scroll
+
+    # Build map of entry counts from Qdrant
+    entry_map = {p["name"]: p for p in qdrant_projects}
+
+    result = []
+    seen_names = set()
+    for mp in meta_projects:
+        name = mp["name"]
+        seen_names.add(name)
+        eq = entry_map.get(name, {})
+        result.append({
+            "id": mp["id"],
+            "name": name,
+            "description": mp.get("description", ""),
+            "color": mp.get("color", "#7c6ff7"),
+            "icon": mp.get("icon", "folder"),
+            "entry_count": eq.get("count", 0),
+            "last_updated": eq.get("last_updated", mp.get("updated_at", "")),
+            "created_at": mp.get("created_at", ""),
+        })
+
+    # Include Qdrant-only projects (entries exist but no SQLite metadata)
+    for qp in qdrant_projects:
+        if qp["name"] not in seen_names:
+            result.append({
+                "id": None,
+                "name": qp["name"],
+                "description": "",
+                "color": "#7c6ff7",
+                "icon": "folder",
+                "entry_count": qp["count"],
+                "last_updated": qp["last_updated"],
+                "created_at": "",
+            })
+
+    return {"projects": result}
+
+
+@rest_app.post("/api/projects")
+async def api_create_project(req: ProjectCreateRequest, user: dict = Depends(require_scope("write"))):
+    existing = await get_project_by_name(req.name)
+    if existing:
+        raise HTTPException(status_code=409, detail="Project already exists")
+    project = await create_project(
+        name=req.name,
+        description=req.description,
+        color=req.color,
+        icon=req.icon,
+        created_by=user.get("user_id"),
+    )
+    return project
+
+
+@rest_app.get("/api/projects/{project_id}")
+async def api_get_project(project_id: int, user: dict = Depends(require_scope("read"))):
+    project = await get_project_meta(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@rest_app.put("/api/projects/{project_id}")
+async def api_update_project(project_id: int, req: ProjectUpdateRequest, user: dict = Depends(require_scope("write"))):
+    success = await update_project(
+        project_id,
+        name=req.name,
+        description=req.description,
+        color=req.color,
+        icon=req.icon,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await get_project_meta(project_id)
+
+
+@rest_app.delete("/api/projects/{project_id}")
+async def api_delete_project(project_id: int, user: dict = Depends(require_scope("write"))):
+    success = await delete_project(project_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"status": "deleted", "id": project_id}
+
+
+@rest_app.get("/api/projects/{project_id}/stats")
+async def api_project_stats(project_id: int, user: dict = Depends(require_scope("read"))):
+    project = await get_project_meta(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    entries = export_entries(project=project["name"])
+    type_counts = {}
+    source_counts = {}
+    for e in entries:
+        t = e.get("type", "unknown")
+        s = e.get("source", "unknown")
+        type_counts[t] = type_counts.get(t, 0) + 1
+        source_counts[s] = source_counts.get(s, 0) + 1
+
+    return {
+        "project": project["name"],
+        "total_entries": len(entries),
+        "by_type": type_counts,
+        "by_source": source_counts,
+    }
+
+
+@rest_app.get("/api/recent")
+async def api_recent(
+    project: Optional[str] = None,
+    limit: int = 10,
+    user: dict = Depends(require_scope("read")),
+):
     return {"entries": get_recent_entries(project=project, limit=limit)}
 
 
-@rest_app.delete("/api/entry/{entry_id}", dependencies=[Depends(verify_rest_key)])
-def api_delete(entry_id: str):
+@rest_app.get("/api/entries")
+async def api_list_entries(
+    project: Optional[str] = Query(None),
+    entry_type: Optional[str] = Query(None),
+    tags: Optional[str] = Query(None),  # comma-separated
+    offset: int = Query(0),
+    limit: int = Query(20),
+    user: dict = Depends(require_scope("read")),
+):
+    """List entries with optional filters and pagination."""
+    must_conditions = []
+    if project:
+        must_conditions.append(FieldCondition(key="project", match=MatchValue(value=project)))
+    if entry_type:
+        must_conditions.append(FieldCondition(key="type", match=MatchValue(value=entry_type)))
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    if tag_list:
+        must_conditions.append(FieldCondition(key="tags", match=MatchAny(any=tag_list)))
+
+    scroll_filter = Filter(must=must_conditions) if must_conditions else None
+
+    all_entries = []
+    q_offset = None
+    while True:
+        results, q_offset = qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=200,
+            offset=q_offset,
+            scroll_filter=scroll_filter,
+            with_payload=True,
+        )
+        if not results:
+            break
+        for r in results:
+            all_entries.append({
+                "id": str(r.id),
+                "content": r.payload.get("content", ""),
+                "project": r.payload.get("project", ""),
+                "tags": r.payload.get("tags", []),
+                "type": r.payload.get("type", ""),
+                "source": r.payload.get("source", ""),
+                "created_at": r.payload.get("created_at", ""),
+            })
+        if q_offset is None:
+            break
+
+    all_entries.sort(key=lambda x: x["created_at"], reverse=True)
+    total = len(all_entries)
+    page_entries = all_entries[offset : offset + limit]
+
+    return {"entries": page_entries, "total": total, "offset": offset, "limit": limit}
+
+
+@rest_app.get("/api/stats")
+async def api_stats(user: dict = Depends(require_scope("read"))):
+    """Global stats for the dashboard."""
+    qdrant_projects = list_projects()
+    total_entries = sum(p["count"] for p in qdrant_projects)
+    all_tags = get_all_tags()
+    return {
+        "total_entries": total_entries,
+        "total_projects": len(qdrant_projects),
+        "total_tags": len(all_tags),
+        "projects": qdrant_projects,
+    }
+
+
+# ── Legacy endpoint ──
+@rest_app.delete("/api/entry/{entry_id}")
+async def api_delete_legacy(entry_id: str, user: dict = Depends(require_scope("write"))):
     delete_entry(entry_id)
     return {"status": "deleted", "id": entry_id}
 
@@ -422,230 +868,6 @@ def api_delete(entry_id: str):
 @rest_app.get("/health")
 def health():
     return {"status": "ok", "model": EMBEDDING_MODEL}
-
-
-# ── Dashboard (no auth — served on same port, auth via Cloudflare Access) ──
-@rest_app.get("/", response_class=HTMLResponse)
-def dashboard():
-    return DASHBOARD_HTML
-
-
-# ──────────────────────────────────────────────
-# Dashboard HTML
-# ──────────────────────────────────────────────
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Knowledge Base</title>
-<style>
-  :root {
-    --bg: #0a0a0f; --surface: #12121a; --border: #1e1e2e;
-    --text: #e0e0e8; --dim: #6b6b80; --accent: #7c6ff7;
-    --accent-glow: rgba(124,111,247,0.15); --danger: #e5534b;
-    --radius: 10px; --font: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-  }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:var(--bg); color:var(--text); font-family:var(--font); font-size:14px; padding:24px; }
-  h1 { font-size:20px; color:var(--accent); margin-bottom:4px; }
-  .subtitle { color:var(--dim); font-size:12px; margin-bottom:24px; }
-  .row { display:flex; gap:16px; margin-bottom:16px; }
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:16px; flex:1; }
-  input, textarea, select {
-    width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text);
-    border-radius:6px; padding:8px 12px; font-family:var(--font); font-size:13px;
-    outline:none; margin-bottom:8px;
-  }
-  input:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-glow); }
-  textarea { min-height:80px; resize:vertical; }
-  button {
-    background:var(--accent); color:#fff; border:none; border-radius:6px;
-    padding:8px 16px; cursor:pointer; font-family:var(--font); font-size:13px;
-    transition: opacity 0.2s;
-  }
-  button:hover { opacity:0.85; }
-  button.secondary { background:transparent; border:1px solid var(--border); color:var(--dim); }
-  .results { margin-top:16px; }
-  .entry {
-    background:var(--bg); border:1px solid var(--border); border-radius:var(--radius);
-    padding:12px; margin-bottom:8px; position:relative;
-  }
-  .entry .meta { color:var(--dim); font-size:11px; margin-bottom:6px; }
-  .entry .content { white-space:pre-wrap; line-height:1.5; font-size:13px; }
-  .entry .score { position:absolute; top:12px; right:12px; color:var(--accent); font-size:11px; }
-  .tag { display:inline-block; background:var(--accent-glow); color:var(--accent); padding:2px 8px; border-radius:4px; font-size:11px; margin-right:4px; }
-  .stats { display:flex; gap:24px; margin-bottom:16px; }
-  .stat { text-align:center; }
-  .stat .num { font-size:24px; color:var(--accent); }
-  .stat .label { font-size:11px; color:var(--dim); }
-  #apiKeyBar { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:12px 16px; margin-bottom:16px; display:flex; gap:8px; align-items:center; }
-  #apiKeyBar input { margin:0; flex:1; }
-  .tabs { display:flex; gap:0; margin-bottom:16px; }
-  .tab { padding:8px 20px; cursor:pointer; border:1px solid var(--border); color:var(--dim); font-size:13px; background:transparent; }
-  .tab:first-child { border-radius:var(--radius) 0 0 var(--radius); }
-  .tab:last-child { border-radius:0 var(--radius) var(--radius) 0; }
-  .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
-  .panel { display:none; }
-  .panel.active { display:block; }
-</style>
-</head>
-<body>
-
-<h1>⬡ Knowledge Base</h1>
-<p class="subtitle">Local vector memory for your AI agents</p>
-
-<div id="apiKeyBar">
-  <span style="color:var(--dim)">API Key:</span>
-  <input type="password" id="apiKey" placeholder="Enter your REST API key">
-  <button onclick="loadDashboard()">Connect</button>
-</div>
-
-<div id="main" style="display:none">
-  <div class="stats" id="stats"></div>
-
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('search')">Search</div>
-    <div class="tab" onclick="switchTab('store')">Store</div>
-    <div class="tab" onclick="switchTab('recent')">Recent</div>
-  </div>
-
-  <!-- Search Panel -->
-  <div class="panel active" id="panel-search">
-    <div class="card">
-      <input type="text" id="searchQuery" placeholder="Search your knowledge base...">
-      <div class="row">
-        <input type="text" id="searchProject" placeholder="Filter by project (optional)" style="flex:1">
-        <button onclick="doSearch()">Search</button>
-      </div>
-      <div class="results" id="searchResults"></div>
-    </div>
-  </div>
-
-  <!-- Store Panel -->
-  <div class="panel" id="panel-store">
-    <div class="card">
-      <textarea id="storeContent" placeholder="Paste content to store..."></textarea>
-      <div class="row">
-        <input type="text" id="storeProject" placeholder="Project name" style="flex:1">
-        <input type="text" id="storeTags" placeholder="Tags (comma-separated)" style="flex:1">
-      </div>
-      <select id="storeType">
-        <option value="session">Session</option>
-        <option value="decision">Decision</option>
-        <option value="pattern">Pattern</option>
-        <option value="debug">Debug</option>
-        <option value="note">Note</option>
-      </select>
-      <button onclick="doStore()">Store Entry</button>
-      <div id="storeResult" style="margin-top:8px;color:var(--dim)"></div>
-    </div>
-  </div>
-
-  <!-- Recent Panel -->
-  <div class="panel" id="panel-recent">
-    <div class="card">
-      <div class="row">
-        <input type="text" id="recentProject" placeholder="Filter by project (optional)" style="flex:1">
-        <button onclick="doRecent()">Load Recent</button>
-      </div>
-      <div class="results" id="recentResults"></div>
-    </div>
-  </div>
-</div>
-
-<script>
-const BASE = window.location.origin;
-let apiKey = '';
-
-function headers() {
-  return { 'Content-Type':'application/json', 'Authorization':'Bearer '+apiKey };
-}
-
-async function loadDashboard() {
-  apiKey = document.getElementById('apiKey').value;
-  try {
-    const r = await fetch(BASE+'/api/projects', {headers:headers()});
-    if (!r.ok) throw new Error('Auth failed');
-    const data = await r.json();
-    document.getElementById('main').style.display='block';
-    let totalEntries = data.projects.reduce((s,p)=>s+p.count,0);
-    document.getElementById('stats').innerHTML = `
-      <div class="stat"><div class="num">${data.projects.length}</div><div class="label">Projects</div></div>
-      <div class="stat"><div class="num">${totalEntries}</div><div class="label">Entries</div></div>
-    `;
-    doRecent();
-  } catch(e) { alert('Connection failed — check your API key'); }
-}
-
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  event.target.classList.add('active');
-  document.getElementById('panel-'+name).classList.add('active');
-}
-
-function esc(s) {
-  let d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function renderEntry(e, showScore=false) {
-  let tags = (e.tags||[]).map(t=>'<span class="tag">'+esc(t)+'</span>').join('');
-  let score = showScore && e.score ? '<div class="score">'+e.score+'</div>' : '';
-  let preview = e.content.length > 500 ? e.content.slice(0,500)+'...' : e.content;
-  return '<div class="entry">'+score+
-    '<div class="meta">'+esc(e.project)+' · '+esc(e.type)+' · '+
-    esc(e.source||'')+' · '+esc(new Date(e.created_at).toLocaleString())+
-    '</div><div class="content">'+esc(preview)+'</div>'+
-    (tags?'<div style="margin-top:6px">'+tags+'</div>':'')+
-    '</div>';
-}
-
-async function doSearch() {
-  const q = document.getElementById('searchQuery').value;
-  const p = document.getElementById('searchProject').value || undefined;
-  const r = await fetch(BASE+'/api/search', {method:'POST',headers:headers(),body:JSON.stringify({query:q,project:p,limit:10})});
-  const data = await r.json();
-  document.getElementById('searchResults').innerHTML = data.results.length
-    ? data.results.map(e=>renderEntry(e,true)).join('')
-    : '<div style="color:var(--dim)">No results found.</div>';
-}
-
-async function doStore() {
-  const body = {
-    content: document.getElementById('storeContent').value,
-    project: document.getElementById('storeProject').value || 'default',
-    tags: document.getElementById('storeTags').value.split(',').map(t=>t.trim()).filter(Boolean),
-    entry_type: document.getElementById('storeType').value,
-    source: 'dashboard'
-  };
-  const r = await fetch(BASE+'/api/store', {method:'POST',headers:headers(),body:JSON.stringify(body)});
-  const data = await r.json();
-  document.getElementById('storeResult').textContent = 'Stored! ID: '+data.id;
-  document.getElementById('storeContent').value = '';
-}
-
-async function doRecent() {
-  const p = document.getElementById('recentProject')?.value || undefined;
-  const r = await fetch(BASE+'/api/recent?limit=20'+(p?'&project='+p:''), {headers:headers()});
-  const data = await r.json();
-  document.getElementById('recentResults').innerHTML = data.entries.length
-    ? data.entries.map(e=>renderEntry(e)).join('')
-    : '<div style="color:var(--dim)">No entries yet.</div>';
-}
-
-// Enter key triggers search
-document.addEventListener('keydown', e => {
-  if (e.key==='Enter' && document.activeElement.id==='searchQuery') doSearch();
-  if (e.key==='Enter' && document.activeElement.id==='apiKey') loadDashboard();
-});
-</script>
-</body>
-</html>
-"""
 
 
 # ──────────────────────────────────────────────

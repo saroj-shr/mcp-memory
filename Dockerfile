@@ -8,6 +8,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 ENV SENTENCE_TRANSFORMERS_HOME=/app/models
 
+RUN mkdir -p /app/data
+
 COPY . .
 
 CMD ["python", "server.py"]

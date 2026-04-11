@@ -10,7 +10,6 @@ services:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
     networks:
       - kb-internal
-    # No ports exposed to host — only reachable by mcp-server on internal network
 
   # ── MCP + REST Server ──
   mcp-server:
@@ -19,16 +18,18 @@ services:
       dockerfile: Dockerfile
     container_name: kb-mcp-server
     restart: unless-stopped
-    ports:
-      - "3000:3000"   # MCP SSE endpoint
-      - "3001:3001"   # REST API + Dashboard
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - MCP_API_KEY=${MCP_API_KEY}
       - REST_API_KEY=${REST_API_KEY}
+      - JWT_SECRET=${JWT_SECRET}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
       - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - SQLITE_DB_PATH=/app/data/memory.db
       - HF_TOKEN=${HF_TOKEN:-}
     depends_on:
       - qdrant
@@ -36,12 +37,47 @@ services:
       - kb-internal
     volumes:
       - model_cache:/app/models
+      - sqlite_data:/app/data
+
+  # ── Next.js Frontend ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: kb-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=
+    depends_on:
+      - mcp-server
+    networks:
+      - kb-internal
+
+  # ── Caddy Reverse Proxy ──
+  caddy:
+    image: caddy:2-alpine
+    container_name: kb-caddy
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - mcp-server
+    networks:
+      - kb-internal
 
 networks:
   kb-internal:
     driver: bridge
-    internal: false  # set to true if you don't need external access to mcp-server
 
 volumes:
   qdrant_data:
   model_cache:
+  sqlite_data:
+  caddy_data:
+  caddy_config:

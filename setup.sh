@@ -28,24 +28,34 @@ echo "✓ Docker found"
 # Generate .env if missing
 if [ ! -f .env ]; then
     echo ""
-    echo "Generating API keys..."
+    echo "Generating API keys and secrets..."
     QDRANT_KEY=$(openssl rand -hex 32)
     MCP_KEY=$(openssl rand -hex 32)
     REST_KEY=$(openssl rand -hex 32)
+    JWT_KEY=$(openssl rand -hex 32)
+    ADMIN_USER="admin"
+    ADMIN_PASS=$(openssl rand -base64 16)
 
     cat > .env <<EOF
 QDRANT_API_KEY=${QDRANT_KEY}
 MCP_API_KEY=${MCP_KEY}
 REST_API_KEY=${REST_KEY}
+JWT_SECRET=${JWT_KEY}
+ADMIN_USERNAME=${ADMIN_USER}
+ADMIN_PASSWORD=${ADMIN_PASS}
+ALLOW_REGISTRATION=false
+HF_TOKEN=
 EOF
 
     echo "✓ Created .env with generated keys"
     echo ""
     echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║  SAVE THESE KEYS — you'll need them for Claude Code    ║"
+    echo "║  SAVE THESE CREDENTIALS                                ║"
     echo "╠══════════════════════════════════════════════════════════╣"
-    echo "║  MCP_API_KEY:  ${MCP_KEY}"
-    echo "║  REST_API_KEY: ${REST_KEY}"
+    echo "║  MCP_API_KEY:     ${MCP_KEY}"
+    echo "║  REST_API_KEY:    ${REST_KEY}"
+    echo "║  Admin Username:  ${ADMIN_USER}"
+    echo "║  Admin Password:  ${ADMIN_PASS}"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo ""
 else
@@ -61,22 +71,25 @@ docker compose up -d
 
 echo ""
 echo "Waiting for services to be ready..."
-sleep 5
+sleep 8
 
 # Health check
-if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
-    echo "✓ REST API is healthy"
+if curl -sf http://localhost/health > /dev/null 2>&1; then
+    echo "✓ Backend API is healthy"
 else
-    echo "⚠ REST API not responding yet — check: docker compose logs mcp-server"
+    echo "⚠ Backend not responding via Caddy yet — check: docker compose logs"
 fi
 
+IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "════════════════════════════════════════"
 echo "  Setup complete!"
 echo ""
-echo "  Dashboard:    http://$(hostname -I | awk '{print $1}'):3001"
-echo "  MCP endpoint: http://$(hostname -I | awk '{print $1}'):3000/sse"
-echo "  REST API:     http://$(hostname -I | awk '{print $1}'):3001/api"
+echo "  Frontend:     http://${IP}"
+echo "  REST API:     http://${IP}/api"
+echo "  MCP endpoint: http://${IP}:3000/sse"
+echo "  Health:       http://${IP}/health"
 echo ""
+echo "  Login with the admin credentials above."
 echo "  Next: configure Claude Code (see claude-code-config.md)"
 echo "════════════════════════════════════════"
